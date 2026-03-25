@@ -1,7 +1,7 @@
-# Binaries
-databridge-agent
-databridge-agent.exe
-databridge-agent-*
+# Binaries (only in root, not cmd/databridge-agent/)
+/databridge-agent
+/databridge-agent.exe
+/databridge-agent-*
 *.exe
 
 # Config with secrets
