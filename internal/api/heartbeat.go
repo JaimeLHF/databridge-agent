@@ -12,12 +12,19 @@ type HeartbeatRequest struct {
 
 // HeartbeatResponse payload recebido da API.
 type HeartbeatResponse struct {
-	Status string          `json:"status"`
-	Config *HeartbeatConfig `json:"config,omitempty"`
+	Status       string          `json:"status"`
+	Config       *HeartbeatConfig `json:"config,omitempty"`
+	PendingQuery *PendingQuery    `json:"pending_query,omitempty"`
 }
 
 type HeartbeatConfig struct {
 	SyncInterval int `json:"sync_interval"`
+}
+
+// PendingQuery representa uma query SQL enfileirada pelo frontend para execucao local.
+type PendingQuery struct {
+	ID  int    `json:"id"`
+	SQL string `json:"sql"`
 }
 
 // Heartbeat envia um heartbeat para a API.

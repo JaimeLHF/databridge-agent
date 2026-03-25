@@ -29,8 +29,9 @@ type Syncer struct {
 
 // schemaMapping armazena o mapeamento de tabelas/colunas do schema_config.
 type schemaMapping struct {
-	Tables  map[string]string            `json:"tables"`
-	Columns map[string]map[string]string `json:"columns"`
+	Tables        map[string]string            `json:"tables"`
+	Columns       map[string]map[string]string `json:"columns"`
+	ExtractionSql string
 }
 
 const cursorFile = ".databridge-cursor"
@@ -77,6 +78,9 @@ func (s *Syncer) Run(ctx context.Context) error {
 
 	// Heartbeat goroutine
 	go s.heartbeatLoop(ctx)
+
+	// Command poll goroutine (polling rapido para queries do frontend)
+	go s.commandPollLoop(ctx)
 
 	// Sync imediato + loop
 	s.doSync()
@@ -127,8 +131,13 @@ func (s *Syncer) loadSchemaConfig() {
 		}
 	}
 
-	// Verificar se tem pelo menos a tabela de invoices configurada
-	if mapping.Tables["invoices"] != "" {
+	// Extrair extraction_sql (query customizada de extracao)
+	if esql, ok := sc["extraction_sql"].(string); ok {
+		mapping.ExtractionSql = esql
+	}
+
+	// Aceitar config se tem tabela de invoices OU extraction_sql customizado
+	if mapping.Tables["invoices"] != "" || mapping.ExtractionSql != "" {
 		s.schemaConfig = mapping
 	}
 }
@@ -158,6 +167,57 @@ func (s *Syncer) sendHeartbeat() {
 	}
 }
 
+// executeRemoteQuery executa uma query SQL recebida via heartbeat e envia o resultado para a API.
+func (s *Syncer) executeRemoteQuery(pq *api.PendingQuery) {
+	log.Printf("[query] Executando query remota #%d: %.80s...", pq.ID, pq.SQL)
+
+	result, err := db.ExecuteQuery(s.conn, pq.SQL, 15, 15*time.Second)
+
+	req := &api.QueryResultRequest{
+		CommandID: pq.ID,
+		MaxRows:   15,
+	}
+
+	if err != nil {
+		log.Printf("[query] Erro na query #%d: %v", pq.ID, err)
+		req.Error = err.Error()
+	} else {
+		log.Printf("[query] Query #%d concluida: %d rows em %.1fms", pq.ID, result.RowCount, result.ExecutionTimeMs)
+		req.Columns = result.Columns
+		req.Rows = result.Rows
+		req.RowCount = result.RowCount
+		req.ExecutionTimeMs = result.ExecutionTimeMs
+		req.Truncated = result.Truncated
+		req.MaxRows = result.MaxRows
+	}
+
+	if pushErr := s.client.PushQueryResult(req); pushErr != nil {
+		log.Printf("[query] Erro ao enviar resultado da query #%d: %v", pq.ID, pushErr)
+	}
+}
+
+// commandPollLoop faz polling rapido (3s) para queries pendentes do frontend.
+func (s *Syncer) commandPollLoop(ctx context.Context) {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pq, err := s.client.GetPendingQueries()
+			if err != nil {
+				// Silencioso — erros de rede nao devem poluir os logs
+				continue
+			}
+			if pq != nil {
+				s.executeRemoteQuery(pq)
+			}
+		}
+	}
+}
+
 // syncLoop executa sincronizacoes no intervalo configurado.
 func (s *Syncer) syncLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Duration(s.cfg.Sync.Interval) * time.Second)
@@ -180,6 +240,11 @@ func (s *Syncer) doSync() {
 		return
 	}
 
+	if s.schemaConfig.ExtractionSql != "" {
+		log.Println("[sync] Modo: SQL customizado")
+	} else {
+		log.Printf("[sync] Modo: mapeamento (tabela: %s)", s.schemaConfig.Tables["invoices"])
+	}
 	log.Printf("[sync] Iniciando sync desde %s...", s.lastSyncedAt.Format("2006-01-02 15:04:05"))
 
 	rows, err := s.fetchRows()
@@ -234,6 +299,13 @@ func (s *Syncer) doSync() {
 
 // fetchRows busca rows do banco local usando o schema_config.
 func (s *Syncer) fetchRows() ([]map[string]interface{}, error) {
+	// Modo SQL customizado: usar a query definida pelo usuario no frontend
+	if s.schemaConfig.ExtractionSql != "" {
+		log.Printf("[sync] Usando query de extracao customizada")
+		return db.ScanRows(s.conn, s.schemaConfig.ExtractionSql)
+	}
+
+	// Modo mapeamento: montar query automaticamente a partir de tabelas/colunas
 	invoiceTable := s.schemaConfig.Tables["invoices"]
 	dateColumn := "issue_date"
 
