@@ -1,0 +1,20 @@
+api:
+  url: "https://api.example.com/api/v1"
+  agent_key: ""      # preenchido automaticamente pelo install
+  agent_secret: ""   # preenchido automaticamente pelo install
+
+database:
+  driver: "pgsql"         # mysql ou pgsql
+  host: "127.0.0.1"
+  port: 5432
+  name: "erp_production"
+  username: "readonly_user"
+  password: "senha_segura"
+
+sync:
+  interval: 3600          # segundos (1 hora)
+  batch_size: 100         # invoices por push
+  since_days: 90          # janela inicial de sync
+
+heartbeat:
+  interval: 60            # segundos

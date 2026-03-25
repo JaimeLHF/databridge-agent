@@ -1,0 +1,24 @@
+# Binaries
+databridge-agent
+databridge-agent.exe
+databridge-agent-*
+*.exe
+
+# Config with secrets
+config.yaml
+
+# Runtime files
+.databridge-cursor
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Misc
+ngrok.zip
+ngrok
