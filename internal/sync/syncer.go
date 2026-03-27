@@ -248,6 +248,8 @@ func (s *Syncer) commandPollLoop(ctx context.Context) {
 					s.handleDiscoverCommand(pq)
 				case "sync":
 					s.handleSyncCommand(pq)
+				case "test_extract":
+					s.handleTestExtractCommand(pq)
 				default:
 					s.executeRemoteQuery(pq)
 				}
@@ -558,6 +560,174 @@ func (s *Syncer) saveCursor() {
 	if err := os.WriteFile(cursorFile, data, 0600); err != nil {
 		log.Printf("[sync] Aviso: nao foi possivel salvar cursor: %v", err)
 	}
+}
+
+// handleTestExtractCommand extrai uma amostra (3 registros) e envia para
+// dry-run de normalizacao via /test-push. O resultado e reportado como command result.
+func (s *Syncer) handleTestExtractCommand(pq *api.PendingQuery) {
+	log.Printf("[command] Test extract solicitado (command #%d)", pq.ID)
+
+	// Recarregar config para ter mapeamento mais recente
+	s.loadSchemaConfig()
+
+	if s.schemaConfig == nil {
+		s.client.PushQueryResult(&api.QueryResultRequest{
+			CommandID: pq.ID,
+			Error:     "Schema nao configurado. Configure o mapeamento no frontend antes de testar.",
+		})
+		return
+	}
+
+	start := time.Now()
+
+	if s.schemaConfig.ExtractionMode == "xml" {
+		s.doTestExtractXml(pq)
+	} else {
+		s.doTestExtractData(pq)
+	}
+
+	elapsed := time.Since(start)
+	log.Printf("[command] Test extract concluido em %.1fs (command #%d)", elapsed.Seconds(), pq.ID)
+}
+
+// doTestExtractData extrai 3 rows em modo data e envia para test-push.
+func (s *Syncer) doTestExtractData(pq *api.PendingQuery) {
+	var rows []map[string]interface{}
+	var err error
+
+	if s.schemaConfig.ExtractionSql != "" {
+		// Executar SQL customizado com LIMIT 3
+		rows, err = db.ScanRows(s.conn, s.schemaConfig.ExtractionSql+" LIMIT 3")
+	} else {
+		invoiceTable := s.schemaConfig.Tables["invoices"]
+		if invoiceTable == "" {
+			s.client.PushQueryResult(&api.QueryResultRequest{
+				CommandID: pq.ID,
+				Error:     "Tabela de invoices nao configurada no mapeamento.",
+			})
+			return
+		}
+		query := fmt.Sprintf("SELECT * FROM %s LIMIT 3", invoiceTable)
+		rows, err = db.ScanRows(s.conn, query)
+	}
+
+	if err != nil {
+		s.client.PushQueryResult(&api.QueryResultRequest{
+			CommandID: pq.ID,
+			Error:     fmt.Sprintf("Erro ao extrair amostra: %v", err),
+		})
+		return
+	}
+
+	if len(rows) == 0 {
+		s.client.PushQueryResult(&api.QueryResultRequest{
+			CommandID: pq.ID,
+			Error:     "Nenhum registro encontrado na tabela configurada.",
+		})
+		return
+	}
+
+	invoices := make([]map[string]interface{}, len(rows))
+	for i, row := range rows {
+		invoices[i] = map[string]interface{}{
+			"invoice": row,
+			"items":   []interface{}{},
+		}
+	}
+
+	result, err := s.client.TestPush(invoices, "")
+	if err != nil {
+		s.client.PushQueryResult(&api.QueryResultRequest{
+			CommandID: pq.ID,
+			Error:     fmt.Sprintf("Erro ao enviar test-push: %v", err),
+		})
+		return
+	}
+
+	// Converter resultado do test-push para command result
+	s.client.PushQueryResult(&api.QueryResultRequest{
+		CommandID: pq.ID,
+		Columns:   []string{"tested", "valid", "errors"},
+		Rows: []map[string]interface{}{{
+			"tested": result.Tested,
+			"valid":  result.Valid,
+			"errors": result.Errors,
+		}},
+		RowCount: 1,
+	})
+}
+
+// doTestExtractXml extrai 3 XMLs e envia para test-push em modo xml.
+func (s *Syncer) doTestExtractXml(pq *api.PendingQuery) {
+	xmlTable := s.schemaConfig.XmlTable
+	xmlCol := s.schemaConfig.XmlColumn
+	idCol := s.schemaConfig.IdColumn
+
+	if xmlTable == "" || xmlCol == "" {
+		s.client.PushQueryResult(&api.QueryResultRequest{
+			CommandID: pq.ID,
+			Error:     "Tabela ou coluna XML nao configurada.",
+		})
+		return
+	}
+
+	query := fmt.Sprintf(
+		"SELECT %s, %s FROM %s WHERE %s IS NOT NULL AND LENGTH(%s) > 100 LIMIT 3",
+		idCol, xmlCol, xmlTable, xmlCol, xmlCol,
+	)
+
+	rows, err := db.ScanRows(s.conn, query)
+	if err != nil {
+		s.client.PushQueryResult(&api.QueryResultRequest{
+			CommandID: pq.ID,
+			Error:     fmt.Sprintf("Erro ao extrair XMLs: %v", err),
+		})
+		return
+	}
+
+	if len(rows) == 0 {
+		s.client.PushQueryResult(&api.QueryResultRequest{
+			CommandID: pq.ID,
+			Error:     "Nenhum XML encontrado na tabela/coluna configurada.",
+		})
+		return
+	}
+
+	invoices := make([]map[string]interface{}, len(rows))
+	for i, row := range rows {
+		xmlContent := ""
+		if v, ok := row[xmlCol]; ok {
+			xmlContent = fmt.Sprintf("%v", v)
+		}
+		rowId := ""
+		if v, ok := row[idCol]; ok {
+			rowId = fmt.Sprintf("%v", v)
+		}
+		invoices[i] = map[string]interface{}{
+			"xml":    xmlContent,
+			"row_id": rowId,
+		}
+	}
+
+	result, err := s.client.TestPush(invoices, "xml")
+	if err != nil {
+		s.client.PushQueryResult(&api.QueryResultRequest{
+			CommandID: pq.ID,
+			Error:     fmt.Sprintf("Erro ao enviar test-push XML: %v", err),
+		})
+		return
+	}
+
+	s.client.PushQueryResult(&api.QueryResultRequest{
+		CommandID: pq.ID,
+		Columns:   []string{"tested", "valid", "errors"},
+		Rows: []map[string]interface{}{{
+			"tested": result.Tested,
+			"valid":  result.Valid,
+			"errors": result.Errors,
+		}},
+		RowCount: 1,
+	})
 }
 
 // autoDiscover descobre o schema do banco e envia para a API automaticamente.
