@@ -29,9 +29,13 @@ type Syncer struct {
 
 // schemaMapping armazena o mapeamento de tabelas/colunas do schema_config.
 type schemaMapping struct {
-	Tables        map[string]string            `json:"tables"`
-	Columns       map[string]map[string]string `json:"columns"`
-	ExtractionSql string
+	Tables         map[string]string            `json:"tables"`
+	Columns        map[string]map[string]string `json:"columns"`
+	ExtractionSql  string
+	ExtractionMode string // "data" (padrao), "xml"
+	XmlTable       string // tabela que contem os XMLs
+	XmlColumn      string // coluna com o XML da NF-e
+	IdColumn       string // coluna de ID (para dedup/cursor)
 }
 
 const cursorFile = ".databridge-cursor"
@@ -69,8 +73,14 @@ func (s *Syncer) Run(ctx context.Context) error {
 		s.cfg.Sync.Interval, s.cfg.Sync.BatchSize, s.cfg.Heartbeat.Interval)
 
 	if s.schemaConfig != nil {
-		invTable := s.schemaConfig.Tables["invoices"]
-		log.Printf("[sync] Tabela de notas: %s", invTable)
+		if s.schemaConfig.ExtractionMode == "xml" {
+			log.Printf("[sync] Modo: XML extraction (tabela: %s, coluna: %s)", s.schemaConfig.XmlTable, s.schemaConfig.XmlColumn)
+		} else if s.schemaConfig.ExtractionSql != "" {
+			log.Println("[sync] Modo: SQL customizado")
+		} else {
+			invTable := s.schemaConfig.Tables["invoices"]
+			log.Printf("[sync] Tabela de notas: %s", invTable)
+		}
 	} else {
 		log.Println("[sync] Schema nao configurado. Executando auto-discover...")
 		s.autoDiscover()
@@ -136,8 +146,22 @@ func (s *Syncer) loadSchemaConfig() {
 		mapping.ExtractionSql = esql
 	}
 
-	// Aceitar config se tem tabela de invoices OU extraction_sql customizado
-	if mapping.Tables["invoices"] != "" || mapping.ExtractionSql != "" {
+	// Extrair extraction_mode e config XML
+	if mode, ok := sc["extraction_mode"].(string); ok {
+		mapping.ExtractionMode = mode
+	}
+	if xt, ok := sc["xml_table"].(string); ok {
+		mapping.XmlTable = xt
+	}
+	if xc, ok := sc["xml_column"].(string); ok {
+		mapping.XmlColumn = xc
+	}
+	if ic, ok := sc["id_column"].(string); ok {
+		mapping.IdColumn = ic
+	}
+
+	// Aceitar config se tem tabela de invoices, extraction_sql, OU modo XML configurado
+	if mapping.Tables["invoices"] != "" || mapping.ExtractionSql != "" || (mapping.ExtractionMode == "xml" && mapping.XmlTable != "" && mapping.XmlColumn != "") {
 		s.schemaConfig = mapping
 	}
 }
@@ -161,9 +185,16 @@ func (s *Syncer) heartbeatLoop(ctx context.Context) {
 }
 
 func (s *Syncer) sendHeartbeat() {
-	_, err := s.client.Heartbeat(s.version)
+	resp, err := s.client.Heartbeat(s.version)
 	if err != nil {
 		log.Printf("[heartbeat] Erro: %v", err)
+		return
+	}
+
+	// Atualizar sync interval se a API informar
+	if resp.Config != nil && resp.Config.SyncInterval > 0 && resp.Config.SyncInterval != s.cfg.Sync.Interval {
+		log.Printf("[heartbeat] Sync interval atualizado: %ds -> %ds", s.cfg.Sync.Interval, resp.Config.SyncInterval)
+		s.cfg.Sync.Interval = resp.Config.SyncInterval
 	}
 }
 
@@ -196,7 +227,7 @@ func (s *Syncer) executeRemoteQuery(pq *api.PendingQuery) {
 	}
 }
 
-// commandPollLoop faz polling rapido (3s) para queries pendentes do frontend.
+// commandPollLoop faz polling rapido (3s) para comandos pendentes do frontend.
 func (s *Syncer) commandPollLoop(ctx context.Context) {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
@@ -212,15 +243,95 @@ func (s *Syncer) commandPollLoop(ctx context.Context) {
 				continue
 			}
 			if pq != nil {
-				s.executeRemoteQuery(pq)
+				switch pq.Type {
+				case "discover":
+					s.handleDiscoverCommand(pq)
+				case "sync":
+					s.handleSyncCommand(pq)
+				default:
+					s.executeRemoteQuery(pq)
+				}
 			}
 		}
 	}
 }
 
+// handleDiscoverCommand executa re-discovery de schema e envia resultado para a API.
+func (s *Syncer) handleDiscoverCommand(pq *api.PendingQuery) {
+	log.Printf("[command] Re-discovery de schema solicitado (command #%d)", pq.ID)
+
+	schema, err := db.DiscoverSchema(s.conn, s.cfg.Database.Driver)
+	if err != nil {
+		log.Printf("[command] Erro ao descobrir schema: %v", err)
+		// Reportar erro para a API
+		s.client.PushQueryResult(&api.QueryResultRequest{
+			CommandID: pq.ID,
+			Error:     fmt.Sprintf("Erro ao descobrir schema: %v", err),
+		})
+		return
+	}
+
+	totalCols := 0
+	for _, t := range schema {
+		totalCols += len(t.Columns)
+	}
+	log.Printf("[command] Encontradas %d tabelas com %d colunas.", len(schema), totalCols)
+
+	result, err := s.client.PushSchema(schema)
+	if err != nil {
+		log.Printf("[command] Erro ao enviar schema: %v", err)
+		s.client.PushQueryResult(&api.QueryResultRequest{
+			CommandID: pq.ID,
+			Error:     fmt.Sprintf("Erro ao enviar schema: %v", err),
+		})
+		return
+	}
+
+	log.Printf("[command] Schema re-descoberto e enviado! %d tabelas.", result.TablesCount)
+
+	// Reportar sucesso
+	s.client.PushQueryResult(&api.QueryResultRequest{
+		CommandID:       pq.ID,
+		Columns:         []string{"tables_count"},
+		Rows:            []map[string]interface{}{{"tables_count": result.TablesCount}},
+		RowCount:        1,
+		ExecutionTimeMs: 0,
+		Truncated:       false,
+		MaxRows:         1,
+	})
+}
+
+// handleSyncCommand executa sync manual solicitado pelo frontend.
+func (s *Syncer) handleSyncCommand(pq *api.PendingQuery) {
+	log.Printf("[command] Sync manual solicitado (command #%d)", pq.ID)
+
+	start := time.Now()
+	s.doSync()
+	elapsed := time.Since(start)
+
+	log.Printf("[command] Sync manual concluido em %.1fs (command #%d)", elapsed.Seconds(), pq.ID)
+
+	s.client.PushQueryResult(&api.QueryResultRequest{
+		CommandID:       pq.ID,
+		Columns:         []string{"status", "duration_ms"},
+		Rows:            []map[string]interface{}{{"status": "completed", "duration_ms": elapsed.Milliseconds()}},
+		RowCount:        1,
+		ExecutionTimeMs: float64(elapsed.Milliseconds()),
+		Truncated:       false,
+		MaxRows:         1,
+	})
+}
+
 // syncLoop executa sincronizacoes no intervalo configurado.
+// Se o schema nao estiver configurado, faz retry rapido (60s) ate encontrar.
 func (s *Syncer) syncLoop(ctx context.Context) {
-	ticker := time.NewTicker(time.Duration(s.cfg.Sync.Interval) * time.Second)
+	interval := time.Duration(s.cfg.Sync.Interval) * time.Second
+	if s.schemaConfig == nil {
+		interval = 60 * time.Second
+		log.Printf("[sync] Schema nao configurado. Retry a cada 60s ate configurar.")
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -228,18 +339,42 @@ func (s *Syncer) syncLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			hadConfig := s.schemaConfig != nil
 			s.doSync()
+			hasConfig := s.schemaConfig != nil
+
+			// Transicao: sem config → com config → mudar para intervalo normal
+			if !hadConfig && hasConfig {
+				ticker.Reset(time.Duration(s.cfg.Sync.Interval) * time.Second)
+				log.Printf("[sync] Config detectado! Proximo sync em %ds.", s.cfg.Sync.Interval)
+			}
+			// Transicao: com config → sem config (removido) → retry rapido
+			if hadConfig && !hasConfig {
+				ticker.Reset(60 * time.Second)
+				log.Printf("[sync] Config removido. Retry a cada 60s.")
+			}
 		}
 	}
 }
 
 // doSync executa uma rodada de sincronizacao.
 func (s *Syncer) doSync() {
+	// Sempre recarregar config da API antes de cada sync
+	// para pegar extraction_sql/mapeamento configurado pelo frontend.
+	s.loadSchemaConfig()
+
 	if s.schemaConfig == nil {
 		log.Println("[sync] Schema nao configurado. Pulando sync. Execute 'discover' e configure no frontend.")
 		return
 	}
 
+	// Modo XML: extrai XMLs de NF-e do banco e envia para parsing
+	if s.schemaConfig.ExtractionMode == "xml" {
+		s.doSyncXml()
+		return
+	}
+
+	// Modo data (SQL customizado ou mapeamento)
 	if s.schemaConfig.ExtractionSql != "" {
 		log.Println("[sync] Modo: SQL customizado")
 	} else {
@@ -295,6 +430,77 @@ func (s *Syncer) doSync() {
 	s.saveCursor()
 
 	log.Printf("[sync] Concluido. Aceitas: %d, Duplicatas: %d", totalAccepted, totalDuplicates)
+}
+
+// doSyncXml extrai XMLs de NF-e do banco local e envia para parsing pelo backend.
+func (s *Syncer) doSyncXml() {
+	xmlTable := s.schemaConfig.XmlTable
+	xmlCol := s.schemaConfig.XmlColumn
+	idCol := s.schemaConfig.IdColumn
+
+	log.Println("[sync] Modo: XML extraction")
+	log.Printf("[sync] Tabela: %s | Coluna XML: %s | ID: %s", xmlTable, xmlCol, idCol)
+
+	// Query para extrair XMLs nao-vazios
+	query := fmt.Sprintf(
+		"SELECT %s, %s FROM %s WHERE %s IS NOT NULL AND LENGTH(%s) > 100 ORDER BY %s LIMIT 500",
+		idCol, xmlCol, xmlTable, xmlCol, xmlCol, idCol,
+	)
+
+	rows, err := db.ScanRows(s.conn, query)
+	if err != nil {
+		log.Printf("[sync] Erro ao buscar XMLs: %v", err)
+		return
+	}
+
+	if len(rows) == 0 {
+		log.Println("[sync] Nenhum XML encontrado.")
+		return
+	}
+
+	log.Printf("[sync] %d XMLs encontrados. Enviando em batches de %d...", len(rows), s.cfg.Sync.BatchSize)
+
+	totalAccepted := 0
+	totalDuplicates := 0
+
+	for i := 0; i < len(rows); i += s.cfg.Sync.BatchSize {
+		end := i + s.cfg.Sync.BatchSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+
+		batch := rows[i:end]
+		invoices := make([]map[string]interface{}, len(batch))
+
+		for j, row := range batch {
+			xmlContent := ""
+			if v, ok := row[xmlCol]; ok {
+				xmlContent = fmt.Sprintf("%v", v)
+			}
+			rowId := ""
+			if v, ok := row[idCol]; ok {
+				rowId = fmt.Sprintf("%v", v)
+			}
+			invoices[j] = map[string]interface{}{
+				"xml":    xmlContent,
+				"row_id": rowId,
+			}
+		}
+
+		result, err := s.client.PushXml(invoices)
+		if err != nil {
+			log.Printf("[sync] Erro ao enviar batch XML %d-%d: %v", i, end, err)
+			continue
+		}
+
+		totalAccepted += result.Accepted
+		totalDuplicates += result.Duplicates
+	}
+
+	s.lastSyncedAt = time.Now()
+	s.saveCursor()
+
+	log.Printf("[sync] XML sync concluido. Aceitas: %d, Duplicatas: %d", totalAccepted, totalDuplicates)
 }
 
 // fetchRows busca rows do banco local usando o schema_config.

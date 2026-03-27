@@ -103,6 +103,32 @@ func cmdInstall() {
 	wizard.Section("DataBridge Agent - Instalacao")
 	fmt.Printf("Versao: %s\n\n", Version)
 
+	// Verificar se ja existe config com credenciais (install anterior interrompido)
+	var cfg *config.Config
+	existingCfg, loadErr := config.Load()
+	if loadErr == nil && existingCfg.API.AgentKey != "" && existingCfg.API.AgentSecret != "" {
+		fmt.Println("Configuracao existente detectada:")
+		fmt.Printf("  API: %s\n", existingCfg.API.URL)
+		fmt.Printf("  Agent Key: %s...%s\n", existingCfg.API.AgentKey[:8], existingCfg.API.AgentKey[len(existingCfg.API.AgentKey)-4:])
+		if existingCfg.Database.Host != "" {
+			fmt.Printf("  Banco: %s (%s:%d/%s)\n",
+				existingCfg.Database.Driver, existingCfg.Database.Host,
+				existingCfg.Database.Port, existingCfg.Database.Name)
+		}
+		fmt.Println()
+
+		choice := wizard.PromptSelect("O que deseja fazer?", []wizard.SelectOption{
+			{Label: "Reconfigurar banco de dados", Value: "reconfig"},
+			{Label: "Reinstalar do zero (novo token)", Value: "fresh"},
+		}, 0)
+
+		if choice == "reconfig" {
+			cfg = existingCfg
+			goto configDb
+		}
+		// fresh: continua com o fluxo normal de registro
+	}
+
 	// ── Step 1: API URL e Token ──
 	if apiURL == "" {
 		apiURL = wizard.Prompt("URL da API DataBridge", "http://localhost:8000/api/v1")
@@ -120,43 +146,51 @@ func cmdInstall() {
 	}
 
 	// ── Step 2: Registrar na API ──
-	fmt.Printf("\nRegistrando agent em %s...\n", apiURL)
+	{
+		fmt.Printf("\nRegistrando agent em %s...\n", apiURL)
 
-	tempCfg := &config.APIConfig{URL: apiURL}
-	client := api.NewClient(tempCfg)
+		tempCfg := &config.APIConfig{URL: apiURL}
+		client := api.NewClient(tempCfg)
 
-	result, err := client.Register(token, "", Version)
-	if err != nil {
-		wizard.Error(fmt.Sprintf("Falha ao registrar: %v", err))
-		fmt.Println("\nVerifique:")
-		fmt.Println("  - A URL da API esta correta?")
-		fmt.Println("  - O token foi copiado corretamente?")
-		fmt.Println("  - O servidor esta acessivel deste computador?")
-		os.Exit(1)
-	}
+		result, err := client.Register(token, "", Version)
+		if err != nil {
+			wizard.Error(fmt.Sprintf("Falha ao registrar: %v", err))
+			fmt.Println("\nVerifique:")
+			fmt.Println("  - A URL da API esta correta?")
+			fmt.Println("  - O token foi copiado corretamente?")
+			fmt.Println("  - O servidor esta acessivel deste computador?")
+			os.Exit(1)
+		}
 
-	wizard.Success("Agent registrado!")
-	fmt.Printf("  Agent Key: %s...%s\n", result.AgentKey[:8], result.AgentKey[len(result.AgentKey)-4:])
+		wizard.Success("Agent registrado!")
+		fmt.Printf("  Agent Key: %s...%s\n", result.AgentKey[:8], result.AgentKey[len(result.AgentKey)-4:])
 
-	// Criar config base
-	cfg := config.DefaultConfig()
-	cfg.API.URL = apiURL
-	cfg.API.AgentKey = result.AgentKey
-	cfg.API.AgentSecret = result.AgentSecret
+		// Criar config base
+		cfg = config.DefaultConfig()
+		cfg.API.URL = apiURL
+		cfg.API.AgentKey = result.AgentKey
+		cfg.API.AgentSecret = result.AgentSecret
 
-	if result.Config.SyncInterval > 0 {
-		cfg.Sync.Interval = result.Config.SyncInterval
-	}
+		if result.Config.SyncInterval > 0 {
+			cfg.Sync.Interval = result.Config.SyncInterval
+		}
 
-	// Pre-preencher driver se veio da API
-	if result.Config.DbDriver != "" {
-		cfg.Database.Driver = result.Config.DbDriver
-		if result.Config.DbDriver == "pgsql" {
-			cfg.Database.Port = 5432
-		} else {
-			cfg.Database.Port = 3306
+		// Pre-preencher driver se veio da API
+		if result.Config.DbDriver != "" {
+			cfg.Database.Driver = result.Config.DbDriver
+			if result.Config.DbDriver == "pgsql" {
+				cfg.Database.Port = 5432
+			} else {
+				cfg.Database.Port = 3306
+			}
+		}
+		// Salvar config imediatamente apos registro (para nao perder credenciais se Ctrl+C)
+		if err := config.Save(cfg); err != nil {
+			log.Printf("Aviso: nao foi possivel salvar config parcial: %v", err)
 		}
 	}
+
+configDb:
 
 	// ── Step 3: Configurar Banco de Dados ──
 	wizard.Section("Configuracao do Banco de Dados")

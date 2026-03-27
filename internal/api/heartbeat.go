@@ -21,10 +21,11 @@ type HeartbeatConfig struct {
 	SyncInterval int `json:"sync_interval"`
 }
 
-// PendingQuery representa uma query SQL enfileirada pelo frontend para execucao local.
+// PendingQuery representa um comando enfileirado pelo frontend para execucao local.
 type PendingQuery struct {
-	ID  int    `json:"id"`
-	SQL string `json:"sql"`
+	ID   int    `json:"id"`
+	Type string `json:"type"`
+	SQL  string `json:"sql"`
 }
 
 // Heartbeat envia um heartbeat para a API.
