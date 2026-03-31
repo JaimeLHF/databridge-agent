@@ -18,7 +18,8 @@ type HeartbeatResponse struct {
 }
 
 type HeartbeatConfig struct {
-	SyncInterval int `json:"sync_interval"`
+	SyncInterval int  `json:"sync_interval"`
+	SyncEnabled  bool `json:"sync_enabled"`
 }
 
 // PendingQuery representa um comando enfileirado pelo frontend para execucao local.

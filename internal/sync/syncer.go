@@ -1,11 +1,16 @@
 package sync
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/prim-ideias/databridge-agent/internal/api"
@@ -22,6 +27,9 @@ type Syncer struct {
 
 	// Schema config obtido da API (tabelas e colunas mapeadas)
 	schemaConfig *schemaMapping
+
+	// sync_enabled: controlado pelo usuario via frontend
+	syncEnabled bool
 
 	// Cursor: ultima data sincronizada (persistido em arquivo local)
 	lastSyncedAt time.Time
@@ -92,8 +100,12 @@ func (s *Syncer) Run(ctx context.Context) error {
 	// Command poll goroutine (polling rapido para queries do frontend)
 	go s.commandPollLoop(ctx)
 
-	// Sync imediato + loop
-	s.doSync()
+	// Sync imediato (somente se habilitado) + loop
+	if s.syncEnabled {
+		s.doSync()
+	} else {
+		log.Println("[sync] Sync desabilitado. Aguardando ativacao pelo usuario.")
+	}
 	s.syncLoop(ctx)
 
 	log.Println("[sync] Encerrado.")
@@ -160,6 +172,13 @@ func (s *Syncer) loadSchemaConfig() {
 		mapping.IdColumn = ic
 	}
 
+	// Extrair sync_enabled (controlado pelo usuario via frontend)
+	if se, ok := sc["sync_enabled"].(bool); ok {
+		s.syncEnabled = se
+	} else {
+		s.syncEnabled = false
+	}
+
 	// Aceitar config se tem tabela de invoices, extraction_sql, OU modo XML configurado
 	if mapping.Tables["invoices"] != "" || mapping.ExtractionSql != "" || (mapping.ExtractionMode == "xml" && mapping.XmlTable != "" && mapping.XmlColumn != "") {
 		s.schemaConfig = mapping
@@ -195,6 +214,19 @@ func (s *Syncer) sendHeartbeat() {
 	if resp.Config != nil && resp.Config.SyncInterval > 0 && resp.Config.SyncInterval != s.cfg.Sync.Interval {
 		log.Printf("[heartbeat] Sync interval atualizado: %ds -> %ds", s.cfg.Sync.Interval, resp.Config.SyncInterval)
 		s.cfg.Sync.Interval = resp.Config.SyncInterval
+	}
+
+	// Atualizar sync_enabled a partir do heartbeat para reacao rapida ao toggle no frontend
+	if resp.Config != nil {
+		prev := s.syncEnabled
+		s.syncEnabled = resp.Config.SyncEnabled
+		if prev != s.syncEnabled {
+			if s.syncEnabled {
+				log.Println("[heartbeat] Sync habilitado pelo usuario.")
+			} else {
+				log.Println("[heartbeat] Sync desabilitado pelo usuario.")
+			}
+		}
 	}
 }
 
@@ -342,6 +374,17 @@ func (s *Syncer) syncLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			hadConfig := s.schemaConfig != nil
+
+			// Recarregar config para obter sync_enabled atualizado
+			s.loadSchemaConfig()
+
+			if !s.syncEnabled {
+				if s.schemaConfig != nil {
+					log.Println("[sync] Sync desabilitado pelo usuario. Pulando sync periodico.")
+				}
+				continue
+			}
+
 			s.doSync()
 			hasConfig := s.schemaConfig != nil
 
@@ -474,19 +517,43 @@ func (s *Syncer) doSyncXml() {
 		batch := rows[i:end]
 		invoices := make([]map[string]interface{}, len(batch))
 
-		for j, row := range batch {
+		invoices = invoices[:0] // reset slice, keep capacity
+		skipped := 0
+		for _, row := range batch {
 			xmlContent := ""
 			if v, ok := row[xmlCol]; ok {
 				xmlContent = fmt.Sprintf("%v", v)
 			}
+
 			rowId := ""
 			if v, ok := row[idCol]; ok {
 				rowId = fmt.Sprintf("%v", v)
 			}
-			invoices[j] = map[string]interface{}{
+
+			// Skip non-NF-e documents (CT-e, MDF-e, etc.)
+			if !looksLikeNfeXml(xmlContent) {
+				skipped++
+				if skipped <= 3 {
+					preview := xmlContent
+					if len(preview) > 80 {
+						preview = preview[:80] + "..."
+					}
+					log.Printf("[sync] XML filtrado (row %s): nao parece NF-e. Preview: %s", rowId, preview)
+				}
+				continue
+			}
+
+			invoices = append(invoices, map[string]interface{}{
 				"xml":    xmlContent,
 				"row_id": rowId,
+			})
+		}
+
+		if len(invoices) == 0 {
+			if skipped > 0 {
+				log.Printf("[sync] Batch %d-%d: todos os %d XMLs filtrados (nenhum NF-e detectado)", i, end, skipped)
 			}
+			continue
 		}
 
 		result, err := s.client.PushXml(invoices)
@@ -752,4 +819,50 @@ func (s *Syncer) autoDiscover() {
 	}
 
 	log.Printf("[auto-discover] Schema enviado! %d tabelas registradas.", result.TablesCount)
+}
+
+// containsNfeMarkers checks for NF-e XML tags in plain text.
+func containsNfeMarkers(s string) bool {
+	return strings.Contains(s, "<nfeProc") ||
+		strings.Contains(s, "<NFe") ||
+		strings.Contains(s, "<infNFe") ||
+		strings.Contains(s, "nfe:infNFe")
+}
+
+// looksLikeNfeXml checks if the XML content looks like an NF-e document.
+// Handles plain XML, base64-encoded XML, and gzip+base64-encoded XML.
+// Returns false for CT-e, MDF-e, NFC-e and other non-NF-e fiscal documents.
+func looksLikeNfeXml(content string) bool {
+	trimmed := strings.TrimSpace(content)
+
+	// Plain XML — check directly
+	if strings.HasPrefix(trimmed, "<") {
+		return containsNfeMarkers(content)
+	}
+
+	// Try base64 decode
+	decoded, err := base64.StdEncoding.DecodeString(trimmed)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(trimmed)
+	}
+	if err != nil || len(decoded) == 0 {
+		return false
+	}
+
+	// Check if decoded is gzip (magic bytes: 0x1f 0x8b)
+	if len(decoded) >= 2 && decoded[0] == 0x1f && decoded[1] == 0x8b {
+		gr, err := gzip.NewReader(bytes.NewReader(decoded))
+		if err != nil {
+			return false
+		}
+		defer gr.Close()
+		decompressed, err := io.ReadAll(gr)
+		if err != nil {
+			return false
+		}
+		return containsNfeMarkers(string(decompressed))
+	}
+
+	// Base64 without gzip
+	return containsNfeMarkers(string(decoded))
 }

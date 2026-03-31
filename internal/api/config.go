@@ -8,6 +8,7 @@ import (
 // ConfigResponse payload recebido do GET /agent/{key}/config.
 type ConfigResponse struct {
 	SyncInterval int             `json:"sync_interval"`
+	SyncEnabled  bool            `json:"sync_enabled"`
 	SchemaConfig json.RawMessage `json:"schema_config"`
 }
 
