@@ -131,7 +131,7 @@ func cmdInstall() {
 
 	// ── Step 1: API URL e Token ──
 	if apiURL == "" {
-		apiURL = wizard.Prompt("URL da API DataBridge", "http://localhost:8000/api/v1")
+		apiURL = wizard.Prompt("URL da API DataBridge", "https://laravel.blueviolet-beaver-250951.hostingersite.com/api/v1")
 	} else {
 		fmt.Printf("URL da API: %s\n", apiURL)
 	}
