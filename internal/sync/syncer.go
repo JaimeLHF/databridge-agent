@@ -486,10 +486,27 @@ func (s *Syncer) doSyncXml() {
 	log.Println("[sync] Modo: XML extraction")
 	log.Printf("[sync] Tabela: %s | Coluna XML: %s | ID: %s", xmlTable, xmlCol, idCol)
 
+	// Escapar identificadores para prevenir SQL injection
+	qTable, err := db.QuoteIdentifier(xmlTable, s.cfg.Database.Driver)
+	if err != nil {
+		log.Printf("[sync] Nome de tabela XML invalido %q: %v", xmlTable, err)
+		return
+	}
+	qXmlCol, err := db.QuoteIdentifier(xmlCol, s.cfg.Database.Driver)
+	if err != nil {
+		log.Printf("[sync] Nome de coluna XML invalido %q: %v", xmlCol, err)
+		return
+	}
+	qIdCol, err := db.QuoteIdentifier(idCol, s.cfg.Database.Driver)
+	if err != nil {
+		log.Printf("[sync] Nome de coluna ID invalido %q: %v", idCol, err)
+		return
+	}
+
 	// Query para extrair XMLs nao-vazios
 	query := fmt.Sprintf(
 		"SELECT %s, %s FROM %s WHERE %s IS NOT NULL AND LENGTH(%s) > 100 ORDER BY %s LIMIT 500",
-		idCol, xmlCol, xmlTable, xmlCol, xmlCol, idCol,
+		qIdCol, qXmlCol, qTable, qXmlCol, qXmlCol, qIdCol,
 	)
 
 	rows, err := db.ScanRows(s.conn, query)
@@ -577,6 +594,12 @@ func (s *Syncer) fetchRows() ([]map[string]interface{}, error) {
 	// Modo SQL customizado: usar a query definida pelo usuario no frontend
 	if s.schemaConfig.ExtractionSql != "" {
 		log.Printf("[sync] Usando query de extracao customizada")
+
+		// Validar que a query e um SELECT seguro (sem multi-statement, sem keywords perigosas)
+		if err := db.ValidateSelectQuery(s.schemaConfig.ExtractionSql); err != nil {
+			return nil, fmt.Errorf("query customizada rejeitada: %w", err)
+		}
+
 		return db.ScanRows(s.conn, s.schemaConfig.ExtractionSql)
 	}
 
@@ -591,13 +614,23 @@ func (s *Syncer) fetchRows() ([]map[string]interface{}, error) {
 		}
 	}
 
+	// Escapar nomes de tabela e coluna para prevenir SQL injection
+	quotedTable, err := db.QuoteIdentifier(invoiceTable, s.cfg.Database.Driver)
+	if err != nil {
+		return nil, fmt.Errorf("nome de tabela invalido %q: %w", invoiceTable, err)
+	}
+	quotedDateCol, err := db.QuoteIdentifier(dateColumn, s.cfg.Database.Driver)
+	if err != nil {
+		return nil, fmt.Errorf("nome de coluna invalido %q: %w", dateColumn, err)
+	}
+
 	query := fmt.Sprintf("SELECT * FROM %s WHERE %s >= ? ORDER BY %s LIMIT 10000",
-		invoiceTable, dateColumn, dateColumn)
+		quotedTable, quotedDateCol, quotedDateCol)
 
 	// PostgreSQL usa $1 ao inves de ?
 	if s.cfg.Database.Driver == "pgsql" {
 		query = fmt.Sprintf("SELECT * FROM %s WHERE %s >= $1 ORDER BY %s LIMIT 10000",
-			invoiceTable, dateColumn, dateColumn)
+			quotedTable, quotedDateCol, quotedDateCol)
 	}
 
 	return db.ScanRows(s.conn, query, s.lastSyncedAt)
@@ -663,6 +696,14 @@ func (s *Syncer) doTestExtractData(pq *api.PendingQuery) {
 	var err error
 
 	if s.schemaConfig.ExtractionSql != "" {
+		// Validar que a query e um SELECT seguro
+		if valErr := db.ValidateSelectQuery(s.schemaConfig.ExtractionSql); valErr != nil {
+			s.client.PushQueryResult(&api.QueryResultRequest{
+				CommandID: pq.ID,
+				Error:     fmt.Sprintf("Query customizada rejeitada: %v", valErr),
+			})
+			return
+		}
 		// Executar SQL customizado com LIMIT 3
 		rows, err = db.ScanRows(s.conn, s.schemaConfig.ExtractionSql+" LIMIT 3")
 	} else {
@@ -674,7 +715,16 @@ func (s *Syncer) doTestExtractData(pq *api.PendingQuery) {
 			})
 			return
 		}
-		query := fmt.Sprintf("SELECT * FROM %s LIMIT 3", invoiceTable)
+		// Escapar nome da tabela
+		quotedTable, quotErr := db.QuoteIdentifier(invoiceTable, s.cfg.Database.Driver)
+		if quotErr != nil {
+			s.client.PushQueryResult(&api.QueryResultRequest{
+				CommandID: pq.ID,
+				Error:     fmt.Sprintf("Nome de tabela invalido %q: %v", invoiceTable, quotErr),
+			})
+			return
+		}
+		query := fmt.Sprintf("SELECT * FROM %s LIMIT 3", quotedTable)
 		rows, err = db.ScanRows(s.conn, query)
 	}
 
@@ -738,9 +788,38 @@ func (s *Syncer) doTestExtractXml(pq *api.PendingQuery) {
 		return
 	}
 
+	// Escapar identificadores
+	qTable, quotErr := db.QuoteIdentifier(xmlTable, s.cfg.Database.Driver)
+	if quotErr != nil {
+		s.client.PushQueryResult(&api.QueryResultRequest{
+			CommandID: pq.ID,
+			Error:     fmt.Sprintf("Nome de tabela invalido %q: %v", xmlTable, quotErr),
+		})
+		return
+	}
+	qXmlCol, quotErr := db.QuoteIdentifier(xmlCol, s.cfg.Database.Driver)
+	if quotErr != nil {
+		s.client.PushQueryResult(&api.QueryResultRequest{
+			CommandID: pq.ID,
+			Error:     fmt.Sprintf("Nome de coluna invalido %q: %v", xmlCol, quotErr),
+		})
+		return
+	}
+	qIdCol := qTable // fallback
+	if idCol != "" {
+		qIdCol, quotErr = db.QuoteIdentifier(idCol, s.cfg.Database.Driver)
+		if quotErr != nil {
+			s.client.PushQueryResult(&api.QueryResultRequest{
+				CommandID: pq.ID,
+				Error:     fmt.Sprintf("Nome de coluna ID invalido %q: %v", idCol, quotErr),
+			})
+			return
+		}
+	}
+
 	query := fmt.Sprintf(
 		"SELECT %s, %s FROM %s WHERE %s IS NOT NULL AND LENGTH(%s) > 100 LIMIT 3",
-		idCol, xmlCol, xmlTable, xmlCol, xmlCol,
+		qIdCol, qXmlCol, qTable, qXmlCol, qXmlCol,
 	)
 
 	rows, err := db.ScanRows(s.conn, query)
