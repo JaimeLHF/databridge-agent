@@ -1,5 +1,5 @@
 api:
-  url: "https://api.example.com/api/v1"
+  url: "https://api.costhub.com.br/api/v1"
   agent_key: ""      # preenchido automaticamente pelo install
   agent_secret: ""   # preenchido automaticamente pelo install
 

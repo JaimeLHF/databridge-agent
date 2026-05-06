@@ -1,5 +1,5 @@
 BINARY_NAME=databridge-agent
-VERSION?=1.1.0
+VERSION?=1.5.0
 LDFLAGS=-ldflags "-X main.Version=$(VERSION)"
 
 .PHONY: build build-linux build-windows build-all clean
