@@ -28,15 +28,26 @@ func ValidateSelectQuery(sql string) error {
 		return fmt.Errorf("query vazia")
 	}
 
-	// Must start with SELECT (case-insensitive)
+	// Must start with a read-only verb (case-insensitive): SELECT, SHOW, EXPLAIN, DESCRIBE, DESC
 	upper := strings.ToUpper(trimmed)
-	if !strings.HasPrefix(upper, "SELECT") {
-		return fmt.Errorf("apenas queries SELECT são permitidas")
+	allowedPrefixes := []string{"SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "DESC ", "WITH"}
+	prefixOK := false
+	for _, p := range allowedPrefixes {
+		if strings.HasPrefix(upper, p) {
+			prefixOK = true
+			break
+		}
+	}
+	if !prefixOK {
+		return fmt.Errorf("apenas queries SELECT/SHOW/EXPLAIN/DESCRIBE/WITH são permitidas")
 	}
 
 	// Strip string literals to avoid false positives on keywords inside strings
 	// Replace 'anything' and "anything" with empty string for keyword scanning
 	cleaned := stripStringLiterals(upper)
+
+	// Strip trailing semicolons (harmless, common in saved queries)
+	cleaned = strings.TrimRight(cleaned, "; \t\n\r")
 
 	// Reject multi-statement queries (semicolons not inside strings)
 	if strings.Contains(cleaned, ";") {
