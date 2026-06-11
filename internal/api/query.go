@@ -15,27 +15,30 @@ type QueryResultRequest struct {
 	Truncated       bool                     `json:"truncated"`
 	MaxRows         int                      `json:"max_rows"`
 	Error           string                   `json:"error,omitempty"`
+	Cancelled       bool                     `json:"cancelled,omitempty"`
 }
 
 // PendingQueriesResponse payload recebido de GET /agent/{key}/pending-queries.
 type PendingQueriesResponse struct {
-	PendingQuery *PendingQuery `json:"pending_query"`
+	PendingQuery  *PendingQuery `json:"pending_query"`
+	Cancellations []int         `json:"cancellations,omitempty"`
 }
 
 // GetPendingQueries busca queries pendentes na API (polling rapido).
-func (c *Client) GetPendingQueries() (*PendingQuery, error) {
+// Retorna a query pendente (se houver) e os IDs de commands a cancelar.
+func (c *Client) GetPendingQueries() (*PendingQuery, []int, error) {
 	path := fmt.Sprintf("/agent/%s/pending-queries", c.agentKey)
 	resp, err := c.doSigned("GET", path, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var result PendingQueriesResponse
 	if err := parseResponse(resp, &result); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return result.PendingQuery, nil
+	return result.PendingQuery, result.Cancellations, nil
 }
 
 // PushQueryResult envia o resultado de uma query executada localmente para a API.

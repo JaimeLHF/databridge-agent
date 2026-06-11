@@ -19,7 +19,14 @@ type QueryResult struct {
 
 // ExecuteQuery executa uma query SELECT com timeout e limite de rows.
 func ExecuteQuery(conn *sql.DB, query string, maxRows int, timeout time.Duration) (*QueryResult, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	return ExecuteQueryCtx(context.Background(), conn, query, maxRows, timeout)
+}
+
+// ExecuteQueryCtx executa uma query SELECT permitindo cancelamento externo
+// via parentCtx. Quando parentCtx for cancelado, o driver MySQL/Postgres
+// aborta a query no banco (KILL / pg_cancel_backend).
+func ExecuteQueryCtx(parentCtx context.Context, conn *sql.DB, query string, maxRows int, timeout time.Duration) (*QueryResult, error) {
+	ctx, cancel := context.WithTimeout(parentCtx, timeout)
 	defer cancel()
 
 	start := time.Now()

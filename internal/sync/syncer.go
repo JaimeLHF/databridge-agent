@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prim-ideias/databridge-agent/internal/api"
@@ -33,6 +34,42 @@ type Syncer struct {
 
 	// Cursor: ultima data sincronizada (persistido em arquivo local)
 	lastSyncedAt time.Time
+
+	// Queries em execucao — mapeadas por command_id para suportar cancelamento.
+	runningMu      sync.Mutex
+	runningQueries map[int]context.CancelFunc
+}
+
+// registerRunningQuery associa um command_id ao seu cancel func.
+func (s *Syncer) registerRunningQuery(commandID int, cancel context.CancelFunc) {
+	s.runningMu.Lock()
+	defer s.runningMu.Unlock()
+	if s.runningQueries == nil {
+		s.runningQueries = make(map[int]context.CancelFunc)
+	}
+	s.runningQueries[commandID] = cancel
+}
+
+// unregisterRunningQuery remove o command_id apos a query terminar.
+func (s *Syncer) unregisterRunningQuery(commandID int) {
+	s.runningMu.Lock()
+	defer s.runningMu.Unlock()
+	delete(s.runningQueries, commandID)
+}
+
+// applyCancellations chama cancel() para cada command_id na lista.
+func (s *Syncer) applyCancellations(ids []int) {
+	if len(ids) == 0 {
+		return
+	}
+	s.runningMu.Lock()
+	defer s.runningMu.Unlock()
+	for _, id := range ids {
+		if cancel, ok := s.runningQueries[id]; ok {
+			log.Printf("[query] Cancelamento solicitado para command #%d — abortando query", id)
+			cancel()
+		}
+	}
 }
 
 // schemaMapping armazena o mapeamento de tabelas/colunas do schema_config.
@@ -231,10 +268,21 @@ func (s *Syncer) sendHeartbeat() {
 }
 
 // executeRemoteQuery executa uma query SQL recebida via heartbeat e envia o resultado para a API.
+//
+// Registra o cancel func no mapa runningQueries antes de iniciar a query —
+// se o frontend solicitar cancelamento, applyCancellations chamara cancel()
+// e o driver MySQL/Postgres abortara a query no banco.
 func (s *Syncer) executeRemoteQuery(pq *api.PendingQuery) {
 	log.Printf("[query] Executando query remota #%d: %.80s...", pq.ID, pq.SQL)
 
-	result, err := db.ExecuteQuery(s.conn, pq.SQL, 15, 15*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	s.registerRunningQuery(pq.ID, cancel)
+	defer func() {
+		s.unregisterRunningQuery(pq.ID)
+		cancel()
+	}()
+
+	result, err := db.ExecuteQueryCtx(ctx, s.conn, pq.SQL, 15, 5*time.Minute)
 
 	req := &api.QueryResultRequest{
 		CommandID: pq.ID,
@@ -242,8 +290,15 @@ func (s *Syncer) executeRemoteQuery(pq *api.PendingQuery) {
 	}
 
 	if err != nil {
-		log.Printf("[query] Erro na query #%d: %v", pq.ID, err)
-		req.Error = err.Error()
+		// ctx.Err() != nil quando cancelado externamente
+		if ctx.Err() == context.Canceled {
+			log.Printf("[query] Query #%d cancelada pelo usuario", pq.ID)
+			req.Cancelled = true
+			req.Error = "Cancelada pelo usuario."
+		} else {
+			log.Printf("[query] Erro na query #%d: %v", pq.ID, err)
+			req.Error = err.Error()
+		}
 	} else {
 		log.Printf("[query] Query #%d concluida: %d rows em %.1fms", pq.ID, result.RowCount, result.ExecutionTimeMs)
 		req.Columns = result.Columns
@@ -269,11 +324,15 @@ func (s *Syncer) commandPollLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			pq, err := s.client.GetPendingQueries()
+			pq, cancellations, err := s.client.GetPendingQueries()
 			if err != nil {
 				// Silencioso — erros de rede nao devem poluir os logs
 				continue
 			}
+
+			// Aplicar cancelamentos solicitados pelo frontend
+			s.applyCancellations(cancellations)
+
 			if pq != nil {
 				switch pq.Type {
 				case "discover":
@@ -283,7 +342,9 @@ func (s *Syncer) commandPollLoop(ctx context.Context) {
 				case "test_extract":
 					s.handleTestExtractCommand(pq)
 				default:
-					s.executeRemoteQuery(pq)
+					// Queries SQL rodam em goroutine para nao bloquear o poll loop —
+					// permite que cancelamentos sejam processados durante a execucao.
+					go s.executeRemoteQuery(pq)
 				}
 			}
 		}
