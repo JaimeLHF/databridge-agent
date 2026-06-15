@@ -72,7 +72,9 @@ func (c *Client) doPush(invoices []map[string]interface{}, mode string) (*PushRe
 	}
 
 	path := fmt.Sprintf("/agent/%s/push", c.agentKey)
-	resp, err := c.doSigned("POST", path, body)
+	// Retry com backoff: o push de backfill envia muitos batches e pode tomar
+	// 429 transitorio — sem retry o batch (e os dados) seriam perdidos.
+	resp, err := c.doSignedRetry("POST", path, body, 6)
 	if err != nil {
 		return nil, err
 	}

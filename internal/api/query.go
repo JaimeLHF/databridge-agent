@@ -49,7 +49,9 @@ func (c *Client) PushQueryResult(req *QueryResultRequest) error {
 	}
 
 	path := fmt.Sprintf("/agent/%s/query-result", c.agentKey)
-	resp, err := c.doSigned("POST", path, body)
+	// Retry: o report de conclusao do comando precisa chegar, senao o comando
+	// fica "running" ate expirar (10min). Tolera 429 transitorio durante um sync.
+	resp, err := c.doSignedRetry("POST", path, body, 6)
 	if err != nil {
 		return err
 	}

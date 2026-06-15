@@ -503,6 +503,7 @@ func (s *Syncer) doSync() {
 
 	totalAccepted := 0
 	totalDuplicates := 0
+	failedBatches := 0
 
 	// Dividir em batches e enviar
 	for i := 0; i < len(rows); i += s.cfg.Sync.BatchSize {
@@ -521,21 +522,33 @@ func (s *Syncer) doSync() {
 			}
 		}
 
+		// Push ja faz retry/backoff em 429 internamente; um erro aqui e falha real.
 		result, err := s.client.Push(invoices)
 		if err != nil {
-			log.Printf("[sync] Erro ao enviar batch %d-%d: %v", i, end, err)
+			log.Printf("[sync] Erro ao enviar batch %d-%d (apos retries): %v", i, end, err)
+			failedBatches++
 			continue
 		}
 
 		totalAccepted += result.Accepted
 		totalDuplicates += result.Duplicates
+
+		// Pacing leve entre batches para suavizar a taxa e evitar 429.
+		if end < len(rows) {
+			time.Sleep(150 * time.Millisecond)
+		}
 	}
 
-	// Atualizar cursor
-	s.lastSyncedAt = time.Now()
-	s.saveCursor()
-
-	log.Printf("[sync] Concluido. Aceitas: %d, Duplicatas: %d", totalAccepted, totalDuplicates)
+	// So avanca o cursor se TODOS os batches foram aceitos. Com falhas, mantem o
+	// cursor para que o proximo sync reenvie (o dedup ignora os ja aceitos) —
+	// evita perda de dados que ficariam "antes" do cursor.
+	if failedBatches > 0 {
+		log.Printf("[sync] Concluido com %d batch(es) falhado(s). Aceitas: %d, Duplicatas: %d. Cursor mantido para reenvio.", failedBatches, totalAccepted, totalDuplicates)
+	} else {
+		s.lastSyncedAt = time.Now()
+		s.saveCursor()
+		log.Printf("[sync] Concluido. Aceitas: %d, Duplicatas: %d", totalAccepted, totalDuplicates)
+	}
 }
 
 // doSyncXml extrai XMLs de NF-e do banco local e envia para parsing pelo backend.
@@ -585,6 +598,7 @@ func (s *Syncer) doSyncXml() {
 
 	totalAccepted := 0
 	totalDuplicates := 0
+	failedBatches := 0
 
 	for i := 0; i < len(rows); i += s.cfg.Sync.BatchSize {
 		end := i + s.cfg.Sync.BatchSize
@@ -636,18 +650,28 @@ func (s *Syncer) doSyncXml() {
 
 		result, err := s.client.PushXml(invoices)
 		if err != nil {
-			log.Printf("[sync] Erro ao enviar batch XML %d-%d: %v", i, end, err)
+			log.Printf("[sync] Erro ao enviar batch XML %d-%d (apos retries): %v", i, end, err)
+			failedBatches++
 			continue
 		}
 
 		totalAccepted += result.Accepted
 		totalDuplicates += result.Duplicates
+
+		// Pacing leve entre batches para suavizar a taxa e evitar 429.
+		if end < len(rows) {
+			time.Sleep(150 * time.Millisecond)
+		}
 	}
 
-	s.lastSyncedAt = time.Now()
-	s.saveCursor()
-
-	log.Printf("[sync] XML sync concluido. Aceitas: %d, Duplicatas: %d", totalAccepted, totalDuplicates)
+	// So avanca o cursor se nenhum batch falhou (ver doSync).
+	if failedBatches > 0 {
+		log.Printf("[sync] XML sync concluido com %d batch(es) falhado(s). Aceitas: %d, Duplicatas: %d. Cursor mantido para reenvio.", failedBatches, totalAccepted, totalDuplicates)
+	} else {
+		s.lastSyncedAt = time.Now()
+		s.saveCursor()
+		log.Printf("[sync] XML sync concluido. Aceitas: %d, Duplicatas: %d", totalAccepted, totalDuplicates)
+	}
 }
 
 // fetchRows busca rows do banco local usando o schema_config.

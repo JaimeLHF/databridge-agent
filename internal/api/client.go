@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/prim-ideias/databridge-agent/internal/auth"
@@ -52,6 +53,75 @@ func (c *Client) doSigned(method, path string, body []byte) (*http.Response, err
 	}
 
 	return resp, nil
+}
+
+// retryableStatus reporta se um status HTTP justifica retry (rate limit / indisponibilidade transitoria).
+func retryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests || // 429
+		code == http.StatusServiceUnavailable || // 503
+		code == http.StatusBadGateway || // 502
+		code == http.StatusGatewayTimeout // 504
+}
+
+// parseRetryAfter le o header Retry-After (segundos). Retorna 0 se ausente/invalido.
+func parseRetryAfter(v string) time.Duration {
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return 0
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// doSignedRetry executa doSigned com retry/backoff em 429/502/503/504.
+// Honra Retry-After quando presente; senao usa backoff exponencial (cap 30s).
+// Erros de transporte (rede) tambem sao retentados. Em status nao-retentavel
+// (2xx ou 4xx como 422) retorna a resposta para o caller tratar.
+func (c *Client) doSignedRetry(method, path string, body []byte, maxAttempts int) (*http.Response, error) {
+	if maxAttempts < 1 {
+		maxAttempts = 1
+	}
+	var lastErr error
+	backoff := 500 * time.Millisecond
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		resp, err := c.doSigned(method, path, body)
+		if err != nil {
+			lastErr = err
+		} else if !retryableStatus(resp.StatusCode) {
+			return resp, nil
+		} else {
+			wait := parseRetryAfter(resp.Header.Get("Retry-After"))
+			if wait <= 0 {
+				wait = backoff
+			}
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("API retornou %d (tentativa %d/%d)", resp.StatusCode, attempt, maxAttempts)
+			err = nil
+			if attempt < maxAttempts {
+				time.Sleep(wait)
+			}
+			backoff = minDuration(backoff*2, 30*time.Second)
+			continue
+		}
+
+		// Erro de transporte — backoff e tenta de novo.
+		if attempt < maxAttempts {
+			time.Sleep(backoff)
+		}
+		backoff = minDuration(backoff*2, 30*time.Second)
+	}
+
+	return nil, lastErr
 }
 
 // doPublic executa uma request sem autenticacao HMAC (usado no register).
